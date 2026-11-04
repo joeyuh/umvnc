@@ -1,0 +1,15 @@
+#!/usr/bin/env bash
+# Connect to U-M VPN. Weblogin + Duo happens in openconnect-sso's embedded browser window.
+# Usage: umvpn [group]   default group: "UMVPN - Only U-M Traffic"
+# Needs: yay -S openconnect-sso
+set -euo pipefail
+GROUP="${1:-UMVPN - Only U-M Traffic}"
+# openconnect-sso 0.8.1 relies on asyncio.get_event_loop() creating a loop, which
+# Python 3.14 no longer does; set one up before handing over to its CLI.
+exec python3 -c '
+import asyncio, sys
+asyncio.set_event_loop(asyncio.new_event_loop())
+from openconnect_sso.cli import main
+sys.argv[0] = "openconnect-sso"
+sys.exit(main())
+' --server umvpn.umnet.umich.edu --authgroup "$GROUP"

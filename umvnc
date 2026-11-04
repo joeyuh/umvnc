@@ -1,0 +1,37 @@
+#!/usr/bin/env bash
+# Remote into CAEN: Linux (VNC over an SSH tunnel) or Windows (Omnissa Horizon). Run `umvpn` first when off-campus.
+# Usage: umvnc [--linux|--windows] [uniqname] [host]   (or set UMICH_UNIQNAME; --linux is the default)
+# Linux host defaults to login-course; oncampus-course has campus-only software but isn't reachable via VPN.
+set -euo pipefail
+
+MODE=linux
+case "${1:-}" in
+  --linux)   MODE=linux;   shift ;;
+  --windows) MODE=windows; shift ;;
+esac
+
+USER_AT="${1:-${UMICH_UNIQNAME:?usage: umvnc [--linux|--windows] <uniqname> [host]}}"
+
+if [[ $MODE == windows ]]; then
+  # CAEN Windows Remote Desktop (CLSE); pick the "CAEN Labs" pool after Duo
+  HOST="${2:-caen.midesktop.it.umich.edu}"
+  exec horizon-client --serverURL="$HOST" --userName="$USER_AT"
+fi
+
+HOST="${2:-login-course.engin.umich.edu}"
+PORT=5951   # CAEN's VNC session port (display :51)
+
+# Tunnel stays up only until the viewer attaches (CAEN's recommended "sleep 30" trick)
+ssh -f -L "$PORT:localhost:$PORT" "$USER_AT@$HOST" "sleep 30"
+# vncviewer is an X11 (XWayland) client, and Hyprland's Wayland->X clipboard bridge is unreliable,
+# so mirror text copies into the X CLIPBOARD ourselves; the viewer forwards that to the remote desktop.
+if command -v xclip >/dev/null && command -v wl-paste >/dev/null; then
+  STATE=$(mktemp)
+  wl-paste --type text --watch sh -c 'new=$(cat); [ "$new" = "$(cat "$1")" ] && exit
+    printf %s "$new" >"$1"; printf %s "$new" | xclip -selection clipboard' _ "$STATE" &
+  BRIDGE=$!
+  trap 'kill $BRIDGE 2>/dev/null; rm -f "$STATE"' EXIT
+else
+  echo "umvnc: install xclip for local->VNC paste (sudo pacman -S xclip)" >&2
+fi
+vncviewer "localhost::$PORT"
