@@ -1,16 +1,217 @@
 #!/usr/bin/env bash
 # Remote into CAEN: Linux (VNC over an SSH tunnel) or Windows (Omnissa Horizon). Run `umvpn` first when off-campus.
-# Usage: umvnc [--linux|--windows] [uniqname] [host]   (or set UMICH_UNIQNAME; --linux is the default)
+# Usage: umvnc [--linux|--windows] [--local-port N] [uniqname] [host]   (or set UMICH_UNIQNAME; --linux is the default)
+#        umvnc --lab HOST [--via JUMP|none] [--local-port N] [uniqname]
 # Linux host defaults to login-course; oncampus-course has campus-only software but isn't reachable via VPN.
+# --local-port N: local end of the tunnel (default 5951), so a second session can run alongside the first.
+# --lab HOST: use a physical lab machine (e.g. eecs2420p14) instead of the VM. Those have no VNC service, so this
+#   starts your own Xvnc + mutter + xterm there (as you, no root; script below), tunnels its private unix socket, and
+#   opens the viewer. The desktop lives exactly as long as this session: CAEN kills your processes when your last
+#   login ends. Needs TigerVNC unpacked in ~/opt/tigervnc/root on the lab machine (see the notes in the script below).
+# --via JUMP: ssh jump host for --lab (default oncampus-course.engin.umich.edu; "none" connects directly).
 set -euo pipefail
 
-MODE=linux
-case "${1:-}" in
-  --linux)   MODE=linux;   shift ;;
-  --windows) MODE=windows; shift ;;
-esac
+# The script that runs on the lab machine. umvnc --lab copies it to ~/opt/tigervnc/start.sh there on every run
+# (so the host always has the current version); you can also run that file by hand: `start.sh` / `start.sh stop`.
+vncstart_script() { cat <<'VNCSTART'
+#!/usr/bin/env bash
+# start.sh -- start (or reuse) your own private TigerVNC desktop on this machine: Xvnc + mutter + xterm. No root.
+# Run by `umvnc --lab`. Prints the VNC unix-socket path as the LAST line of stdout; everything else goes to stderr.
+#   start.sh         start it if it isn't already running
+#   start.sh stop    stop it (its mutter/xterm clients exit with it)
+#
+# One-time setup per account (home is shared across CAEN machines): unpack TigerVNC's el9 server package into
+# ~/opt/tigervnc/root WITHOUT rpm or root, so that ~/opt/tigervnc/root/usr/bin/Xvnc exists. Download
+# tigervnc-server-minimal-*.el9.x86_64.rpm from https://sourceforge.net/projects/tigervnc/files/stable/ , verify its
+# hash, cut the xz-compressed cpio payload out of the rpm (a 15-line python script does it) and `xz -dc payload |
+# (cd ~/opt/tigervnc/root && cpio -idm)`.
+#
+# Security: no TCP listener at all. The VNC socket is mode 0600 in your private /run/user/UID dir, and the X display
+# requires a fresh auth cookie, so other students on a shared lab machine can't reach either.
+# Lifetime: CAEN sets KillUserProcesses=yes, so everything dies when your last login on this machine ends.
+set -euo pipefail
 
-USER_AT="${1:-${UMICH_UNIQNAME:?usage: umvnc [--linux|--windows] <uniqname> [host]}}"
+# Run under a login shell so the desktop (and its xterm) get the environment a normal ssh login has (CAEN module
+# setup, PATH, ...) -- a bare `ssh host cmd` has none of it and Virtuoso wouldn't be found.
+[[ -n ${VNCSTART_LOGIN:-} ]] || exec env VNCSTART_LOGIN=1 bash -l "$0" "$@"
+
+XVNC=${VNC_XVNC:-$HOME/opt/tigervnc/root/usr/bin/Xvnc}
+GEOMETRY=${VNC_GEOMETRY:-1920x1080}
+UIDN=$(id -u)
+log() { echo "start.sh: $*" >&2; }
+die() { log "$*"; exit 1; }
+
+RT=${XDG_RUNTIME_DIR:-/run/user/$UIDN}
+[[ -d $RT && -O $RT && $(stat -c %a "$RT") == 700 ]] || die "no private runtime dir at $RT"
+D=$RT/vnc; mkdir -p -m 700 "$D"
+SOCK=$D/xvnc.sock AUTH=$D/xvnc.auth PIDF=$D/xvnc.pid DISPF=$D/xvnc.display
+
+# pid of OUR Xvnc, if it is alive (we only ever signal a pid we recorded and re-verified)
+xvnc_pid() {
+  local p; p=$(cat "$PIDF" 2>/dev/null) || return 1
+  [[ $p =~ ^[0-9]+$ && $(ps -o comm= -p "$p" 2>/dev/null) == Xvnc ]] || return 1
+  echo "$p"
+}
+
+if [[ ${1:-} == stop ]]; then
+  if p=$(xvnc_pid); then kill "$p"; log "stopped Xvnc (pid $p)"; else log "no session running"; fi
+  rm -f "$SOCK" "$AUTH" "$PIDF" "$DISPF" "$D/termkey.pid"   # the Ctrl+Alt+T helper exits when its X server does
+  exit 0
+fi
+
+[[ -x $XVNC ]] || die "Xvnc not found at $XVNC (see the setup notes at the top of this script)"
+for c in xauth mcookie xprop xwininfo mutter dbus-run-session xterm; do
+  command -v "$c" >/dev/null || die "missing required program: $c"
+done
+
+# a display number is free unless a live process holds its lock (a stale lock gets cleaned up by the server)
+display_free() {
+  local lock=/tmp/.X$1-lock pid
+  if [[ -e $lock ]]; then
+    pid=$(tr -d '[:space:]' <"$lock" 2>/dev/null || true)
+    [[ -n $pid && -d /proc/$pid ]] && return 1
+    return 0
+  fi
+  [[ ! -e /tmp/.X11-unix/X$1 ]]
+}
+
+if p=$(xvnc_pid) && [[ -S $SOCK && -f $AUTH && -f $DISPF ]]; then
+  n=$(cat "$DISPF")
+  log "reusing the session on :$n (Xvnc pid $p)"
+else
+  if p=$(xvnc_pid); then log "found Xvnc (pid $p) without its socket; replacing it"; kill "$p"; sleep 1; fi
+  rm -f "$SOCK" "$AUTH" "$PIDF" "$DISPF"
+  n=51
+  while ! display_free "$n"; do n=$((n + 1)); (( n <= 79 )) || die "no free X display in :51-:79"; done
+  ( umask 077; xauth -f "$AUTH" add ":$n" . "$(mcookie)" ) 2>/dev/null
+  nohup "$XVNC" ":$n" -auth "$AUTH" -nolisten tcp -rfbport -1 -rfbunixpath "$SOCK" -rfbunixmode 0600 \
+    -SecurityTypes None -geometry "$GEOMETRY" -depth 24 >"$D/xvnc.log" 2>&1 </dev/null &
+  echo $! >"$PIDF"; echo "$n" >"$DISPF"
+  for _ in $(seq 1 75); do
+    [[ -S $SOCK ]] && break
+    kill -0 "$(cat "$PIDF")" 2>/dev/null || { tail -n 15 "$D/xvnc.log" >&2; die "Xvnc exited at startup"; }
+    sleep 0.2
+  done
+  [[ -S $SOCK ]] || die "Xvnc never created $SOCK"
+  log "started Xvnc on :$n (pid $(cat "$PIDF"))"
+fi
+
+export DISPLAY=:$n XAUTHORITY=$AUTH XDG_SESSION_TYPE=x11
+
+# window manager (title bars, move/resize)
+have_wm() { xprop -root -notype _NET_SUPPORTING_WM_CHECK 2>/dev/null | grep -q 'window id'; }
+if ! have_wm; then
+  nohup dbus-run-session -- mutter --x11 --sm-disable >"$D/mutter.log" 2>&1 </dev/null &
+  for _ in $(seq 1 50); do have_wm && break; sleep 0.2; done
+  if have_wm; then log "mutter is up"; else log "warning: mutter did not come up (see $D/mutter.log); continuing without a window manager"; fi
+fi
+
+# an xterm, always: start one unless one of ours (class name "vncterm") is already on this display
+has_xterm() { xwininfo -root -tree 2>/dev/null | grep -q '"vncterm"'; }
+if ! has_xterm; then
+  nohup xterm -name vncterm -ls -title "$(hostname -s) :$n" -geometry 110x35+40+40 -fa Monospace -fs 11 \
+    >"$D/xterm.log" 2>&1 </dev/null &
+  for _ in $(seq 1 50); do has_xterm && break; sleep 0.2; done
+  has_xterm || { tail -n 5 "$D/xterm.log" >&2; die "xterm did not appear on :$n"; }
+  log "xterm is up"
+fi
+
+# Ctrl+Alt+T opens another terminal. mutter has no run-command shortcuts of its own, so this tiny helper (pure
+# ctypes + libX11, nothing to install) grabs the key; it exits by itself when the X server goes away. It means
+# closing the last xterm can't strand the desktop.
+termkey_alive() {
+  local p; p=$(cat "$D/termkey.pid" 2>/dev/null) || return 1
+  [[ $p =~ ^[0-9]+$ && $(ps -o args= -p "$p" 2>/dev/null) == *termkey.py* ]]
+}
+if ! termkey_alive; then
+  cat >"$D/termkey.py" <<'PYKEY'
+import ctypes, ctypes.util, os, signal, struct, subprocess, sys, time
+
+X = ctypes.CDLL(ctypes.util.find_library("X11") or "libX11.so.6")
+vp, ci, cu, cl = ctypes.c_void_p, ctypes.c_int, ctypes.c_uint, ctypes.c_ulong
+X.XOpenDisplay.restype, X.XOpenDisplay.argtypes = vp, [ctypes.c_char_p]
+X.XDefaultRootWindow.restype, X.XDefaultRootWindow.argtypes = cl, [vp]
+X.XStringToKeysym.restype, X.XStringToKeysym.argtypes = cl, [ctypes.c_char_p]
+X.XKeysymToKeycode.restype, X.XKeysymToKeycode.argtypes = ctypes.c_ubyte, [vp, cl]
+X.XGrabKey.argtypes = [vp, ci, cu, cl, ci, ci, ci]
+X.XNextEvent.argtypes = [vp, vp]
+X.XSync.argtypes = [vp, ci]
+ERRH = ctypes.CFUNCTYPE(ci, vp, vp)
+X.XSetErrorHandler.restype, X.XSetErrorHandler.argtypes = vp, [ERRH]
+
+failed = []
+def on_error(dpy, ev):
+    failed.append(1)
+    return 0
+handler = ERRH(on_error)          # keep a reference so it isn't garbage-collected
+X.XSetErrorHandler(handler)
+
+dpy = X.XOpenDisplay(None)        # uses $DISPLAY
+if not dpy:
+    sys.exit("termkey: cannot open display %s" % os.environ.get("DISPLAY"))
+root = X.XDefaultRootWindow(dpy)
+key = X.XKeysymToKeycode(dpy, X.XStringToKeysym(b"t"))
+CTRL, ALT, LOCK, NUMLOCK = 0x04, 0x08, 0x02, 0x10
+for extra in (0, LOCK, NUMLOCK, LOCK | NUMLOCK):      # also match with CapsLock / NumLock on
+    X.XGrabKey(dpy, key, CTRL | ALT | extra, root, 0, 1, 1)
+X.XSync(dpy, 0)
+if failed:
+    sys.exit("termkey: Ctrl+Alt+T is already grabbed by another client")
+print("termkey: Ctrl+Alt+T opens an xterm on %s" % os.environ.get("DISPLAY"), flush=True)
+
+signal.signal(signal.SIGCHLD, signal.SIG_IGN)         # children are reaped automatically
+host = os.uname().nodename.split(".")[0]
+ev = ctypes.create_string_buffer(192)                 # sizeof(XEvent)
+count, last = 0, 0.0
+while True:
+    X.XNextEvent(dpy, ev)         # if the server goes away Xlib exits the process, which is what we want
+    if struct.unpack_from("i", ev, 0)[0] != 2:        # KeyPress only
+        continue
+    if time.monotonic() - last < 0.5:                 # ignore key auto-repeat
+        continue
+    last = time.monotonic()
+    count += 1
+    off = 30 * (count % 8)                            # cascade new windows a little
+    subprocess.Popen(["xterm", "-name", "vncterm", "-ls", "-title", "%s %s" % (host, os.environ.get("DISPLAY")),
+                      "-geometry", "110x35+%d+%d" % (60 + off, 60 + off), "-fa", "Monospace", "-fs", "11"],
+                     stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                     start_new_session=True)
+PYKEY
+  : >"$D/termkey.log"
+  nohup python3 -I "$D/termkey.py" >>"$D/termkey.log" 2>&1 </dev/null &
+  echo $! >"$D/termkey.pid"
+  for _ in $(seq 1 25); do
+    grep -q 'opens an xterm' "$D/termkey.log" && break
+    termkey_alive || break
+    sleep 0.2
+  done
+  if grep -q 'opens an xterm' "$D/termkey.log"; then log "Ctrl+Alt+T opens a new terminal"
+  else log "warning: Ctrl+Alt+T helper did not start: $(tail -n 1 "$D/termkey.log")"; fi
+fi
+
+log "ready: display :$n; stop with: ~/opt/tigervnc/start.sh stop"
+echo "$SOCK"
+VNCSTART
+}
+
+MODE=linux
+LPORT=
+LAB=
+VIA=oncampus-course.engin.umich.edu
+while [[ ${1:-} == --* ]]; do
+  case $1 in
+    --linux)      MODE=linux ;;
+    --windows)    MODE=windows ;;
+    --local-port) LPORT=${2:?--local-port needs a port number}; shift ;;
+    --lab)        LAB=${2:?--lab needs a host}; shift ;;
+    --via)        VIA=${2:?--via needs a host, or "none"}; shift ;;
+    *)            echo "umvnc: unknown option $1" >&2; exit 2 ;;
+  esac
+  shift
+done
+[[ -z $LPORT || $LPORT =~ ^[0-9]+$ ]] || { echo "umvnc: --local-port must be a number, got '$LPORT'" >&2; exit 2; }
+
+USER_AT="${1:-${UMICH_UNIQNAME:?usage: umvnc [--linux|--windows] [--local-port N] <uniqname> [host]   |   umvnc --lab HOST [--via JUMP|none] <uniqname>}}"
 
 if [[ $MODE == windows ]]; then
   # CAEN Windows Remote Desktop (CLSE); pick the "CAEN Labs" pool after Duo
@@ -18,11 +219,50 @@ if [[ $MODE == windows ]]; then
   exec horizon-client --serverURL="$HOST" --userName="$USER_AT"
 fi
 
-HOST="${2:-login-course.engin.umich.edu}"
-PORT=5951   # CAEN's VNC session port (display :51)
+JUMP=()
+if [[ -n $LAB ]]; then
+  HOST=$LAB; [[ $HOST == *.* ]] || HOST=$HOST.engin.umich.edu
+  [[ $VIA == none ]] || JUMP=(-J "$USER_AT@$VIA")
+else
+  HOST="${2:-login-course.engin.umich.edu}"
+fi
+PORT=5951   # CAEN's VNC session port (display :51), on the remote end
+LPORT="${LPORT:-$PORT}"   # local end of the tunnel; --local-port changes it
 
-# Tunnel stays up only until the viewer attaches (CAEN's recommended "sleep 30" trick)
-ssh -f -L "$PORT:localhost:$PORT" "$USER_AT@$HOST" "sleep 30"
+# Fail fast, before any password/Duo prompts, if something already holds the local port
+# (another umvnc session, or a tunnel left behind by one).
+if (exec 3<>"/dev/tcp/127.0.0.1/$LPORT") 2>/dev/null; then
+  echo "umvnc: local port $LPORT is already in use (another session or a stale tunnel?) -- see: ss -ltnp | grep :$LPORT; or use --local-port" >&2
+  exit 2
+fi
+
+# One SSH master connection: authenticate once (Duo prompts appear in the foreground),
+# keep the tunnel open for the whole session, then attach an interactive shell over the
+# same connection -- no second Duo prompt. No "sleep 30" race; the tunnel lives as long
+# as the shell does.
+CTL=$(mktemp -u /tmp/umvnc-ssh.XXXXXX)
+cleanup() { ssh -S "$CTL" -O exit "$USER_AT@$HOST" 2>/dev/null || true; rm -f "$CTL"; }
+if [[ -n $LAB ]]; then
+  # No -L yet: the lab desktop's socket path is only known after the remote script has run (see below).
+  ssh -f -N -M -S "$CTL" "${JUMP[@]}" "$USER_AT@$HOST"
+else
+  ssh -f -N -M -S "$CTL" -o ExitOnForwardFailure=yes -L "$LPORT:localhost:$PORT" "$USER_AT@$HOST"
+fi
+trap cleanup EXIT
+
+if [[ -n $LAB ]]; then
+  # Copy the starter over (temp file + mv, so a half-written script never runs), run it, and tunnel to the unix
+  # socket it prints. Its output may be preceded by login-shell noise, so only the last line counts.
+  ssh -S "$CTL" "$USER_AT@$HOST" \
+    'mkdir -p ~/opt/tigervnc && cat >~/opt/tigervnc/start.sh.new && chmod 700 ~/opt/tigervnc/start.sh.new && mv -f ~/opt/tigervnc/start.sh.new ~/opt/tigervnc/start.sh' \
+    < <(vncstart_script) || { echo "umvnc: could not copy the starter script to $HOST" >&2; exit 1; }
+  SOCK=$(ssh -S "$CTL" "$USER_AT@$HOST" '~/opt/tigervnc/start.sh' | tail -n 1) \
+    || { echo "umvnc: starting the desktop on $HOST failed (see the messages above)" >&2; exit 1; }
+  [[ $SOCK == /*.sock ]] || { echo "umvnc: unexpected output from the remote starter: '$SOCK'" >&2; exit 1; }
+  ssh -S "$CTL" -O forward -L "127.0.0.1:$LPORT:$SOCK" "$USER_AT@$HOST" \
+    || { echo "umvnc: could not forward $SOCK (does the server allow unix-socket forwarding?)" >&2; exit 1; }
+fi
+
 # vncviewer is an X11 (XWayland) client, and Hyprland's Wayland->X clipboard bridge is unreliable,
 # so mirror text copies into the X CLIPBOARD ourselves; the viewer forwards that to the remote desktop.
 if command -v xclip >/dev/null && command -v wl-paste >/dev/null; then
@@ -30,8 +270,15 @@ if command -v xclip >/dev/null && command -v wl-paste >/dev/null; then
   wl-paste --type text --watch sh -c 'new=$(cat); [ "$new" = "$(cat "$1")" ] && exit
     printf %s "$new" >"$1"; printf %s "$new" | xclip -selection clipboard' _ "$STATE" &
   BRIDGE=$!
-  trap 'kill $BRIDGE 2>/dev/null; rm -f "$STATE"' EXIT
+  trap 'kill $BRIDGE 2>/dev/null || true; rm -f "$STATE"; cleanup' EXIT
 else
   echo "umvnc: install xclip for local->VNC paste (sudo pacman -S xclip)" >&2
 fi
-vncviewer "localhost::$PORT"
+
+# Prefer TigerVNC (xtigervncviewer); plain vncviewer may be RealVNC after its .deb hijacks /usr/bin/vncviewer.
+VIEWER=$(command -v xtigervncviewer || command -v vncviewer)
+"$VIEWER" "localhost::$LPORT" &
+
+# Interactive shell on the same (already-authenticated) SSH connection.
+# Exit the shell to tear down the viewer, tunnel, and clipboard bridge.
+ssh -S "$CTL" -t "$USER_AT@$HOST"
